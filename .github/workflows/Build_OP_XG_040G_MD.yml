@@ -183,6 +183,7 @@ jobs:
         内核版本: 6.12.X
         源码仓库: $REPO_URL
         分支: $REPO_BRANCH
+        后台 10.0.0.1
         EOF
         echo "status=success" >> $GITHUB_OUTPUT
 
