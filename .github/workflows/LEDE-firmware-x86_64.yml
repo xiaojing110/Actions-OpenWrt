@@ -3,7 +3,7 @@ name: Build LEDE Firmware
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 3 * * *'  # UTC 3:00 ≈ 北京 11:00
+    - cron: '0 3 * * *'  # UTC 3:00 ≈ 北京时间 11:00
   push:
     branches:
       - main
@@ -16,9 +16,27 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 最大化磁盘空间（非常推荐，LEDE 编译吃空间）
+      # 安装 OpenWrt/LEDE 编译所需系统依赖（防止缺失导致失败）
+      - name: Install build dependencies
+        run: |
+          sudo apt update -y
+          sudo apt full-upgrade -y
+          sudo apt install -y \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk gcc-multilib \
+            g++-multilib gettext genisoimage git gperf haveged help2man intltool \
+            libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+            libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev \
+            libreadline-dev libssl-dev libtool llvm lrzsz libnsl-dev ninja-build p7zip \
+            p7zip-full patch pkgconf python3 python3-pyelftools python3-setuptools \
+            qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs \
+            upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+          sudo apt clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      # 最大化构建空间（使用最新支持 remove-codeql 等参数的版本）
       - name: Maximize build space
-        uses: easimon/maximize-build-space@v1
+        uses: easimon/maximize-build-space@master  # 或 @v10 如果你确认 tag 存在；master 通常包含最新功能
         with:
           root-reserve-mb: 512
           swap-size-mb: 1024
@@ -34,24 +52,24 @@ jobs:
           git clone https://github.com/coolsnowwolf/lede.git
           cd lede
 
-      # 添加/修改 feeds（mosdns + passwall feed + luci 指定分支 + qmodem）
+      # 修改 feeds.conf.default（luci 分支、qmodem、mosdns 等）
       - name: Modify feeds.conf.default
         working-directory: ./lede
         run: |
-          # 指定 coolsnowwolf 的 luci 25.12 分支
+          # 指定 luci 为 coolsnowwolf 的 openwrt-25.12 分支
           sed -i '/^src-git luci/c\src-git luci https://github.com/coolsnowwolf/luci.git;openwrt-25.12' feeds.conf.default
           
-          # 取消注释 qmodem（假设原文件中有 #src-git qmodem ...）
+          # 取消注释 qmodem（假设原文件中有被注释的行）
           sed -i 's/^#src-git qmodem/src-git qmodem/' feeds.conf.default
           
-          # 添加 mosdns feed（你原有的）
+          # 添加 mosdns feed
           echo "src-git mosdns https://github.com/sbwml/luci-app-mosdns.git" >> feeds.conf.default
           
-          # 如果你想加 passwall feed（但下面会用稀疏方式替换 app，所以可选注释）
+          # 可选：passwall feed（但下面用稀疏方式替换 app，所以可注释）
           # echo "src-git passwall https://github.com/Openwrt-Passwall/openwrt-passwall.git" >> feeds.conf.default
           # echo "src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git" >> feeds.conf.default
-
-          cat feeds.conf.default  # 打印出来方便调试
+          
+          cat feeds.conf.default  # 打印调试
 
       # 更新并安装 feeds
       - name: Update and install feeds
@@ -60,46 +78,38 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # 替换 luci-app-passwall 为官方仓库版本（使用稀疏检出，节省空间）
+      # 特殊替换 luci-app-passwall（稀疏检出，只拉取必要部分）
       - name: Replace luci-app-passwall with sparse checkout
         working-directory: ./lede/feeds/luci/applications
         run: |
-          echo "删除旧的 luci-app-passwall（如果存在）..."
-          rm -rf luci-app-passwall
+          rm -rf luci-app-passwall || true
           
-          echo "克隆 openwrt-passwall 仓库（仅用于提取 app）..."
           git clone --depth=1 https://github.com/Openwrt-Passwall/openwrt-passwall.git temp-passwall
-          
           cd temp-passwall
           git sparse-checkout init --cone
           git sparse-checkout set luci-app-passwall
           git checkout
           
-          echo "移动 luci-app-passwall 到正确位置..."
           mv luci-app-passwall ../../
-          
           cd ..
           rm -rf temp-passwall
           
-          echo "luci-app-passwall 替换完成！"
+          echo "luci-app-passwall 替换完成"
 
-      # 自定义修改（IP、主题等）
+      # 应用自定义补丁（IP 修改、主题替换等）
       - name: Apply custom patches
         working-directory: ./lede
         run: |
-          echo "修改默认 IP 地址为 10.0.0.1..."
+          echo "修改默认 IP 为 10.0.0.1..."
           sed -i 's/192.168.1.1/10.0.0.1/g' package/base-files/files/bin/config_generate
           sed -i 's/192.168.1./10.0.0./g'   package/base-files/files/bin/config_generate
           sed -i 's/192.168./10.0./g'        package/base-files/files/bin/config_generate
           
-          echo "更新主题为 luci-theme-argon..."
-          # 替换默认主题（通常是 bootstrap 或 material）
+          echo "设置主题为 luci-theme-argon..."
           find feeds/luci/collections/ -type f -name Makefile -exec \
             sed -i -E 's/(luci-theme-)[a-zA-Z0-9_-]+/\1argon/g' {} \;
-          
-          # 如果 argon 没被包含，可额外在 .config 启用 CONFIG_PACKAGE_luci-theme-argon=y
 
-      # 缓存下载文件
+      # 缓存下载文件（加速重复构建）
       - name: Cache downloads
         uses: actions/cache@v4
         with:
@@ -115,99 +125,75 @@ jobs:
           key: ${{ runner.os }}-lede-toolchain-${{ hashFiles('lede/.config') }}
           restore-keys: ${{ runner.os }}-lede-toolchain-
 
-            # 准备 .config（优先使用仓库中 X86/.config）
+      # 准备 .config（优先读取仓库中 X86/.config）
       - name: Prepare .config
         working-directory: ./lede
         run: |
-          echo "检查仓库中 X86 目录下的 .config 文件..."
+          echo "检查 X86/.config ..."
           
-          # 优先级1：仓库根目录下的 X86/.config
           if [ -f ../X86/.config ]; then
-            echo "找到 ../X86/.config，使用它作为配置"
+            echo "使用仓库中的 ../X86/.config"
             cp ../X86/.config ./
-          
-          # 优先级2：仓库根目录直接的 .config（可选兼容旧方式）
           elif [ -f ../.config ]; then
-            echo "未找到 X86/.config，但找到根目录 .config，使用它"
+            echo "使用根目录 .config"
             cp ../.config ./
-          
-          # 优先级3：脚本内置默认配置
           else
-            echo "未找到任何 .config 文件，使用脚本内置默认配置"
+            echo "使用内置默认配置"
             cat > .config << 'EOF'
           CONFIG_TARGET_x86=y
           CONFIG_TARGET_x86_64=y
           CONFIG_TARGET_x86_64_DEVICE_generic=y
           
-          # 基础 LuCI
           CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-theme-argon=y
           
-          # 常用组件
           CONFIG_PACKAGE_luci-app-passwall=y
           CONFIG_PACKAGE_luci-app-mosdns=y
           
-          # 推荐：启用 argon 主题
-          CONFIG_PACKAGE_luci-theme-argon=y
-          
-          # firewall4 + nftables（推荐）
           CONFIG_PACKAGE_firewall4=y
           CONFIG_PACKAGE_nftables=y
           CONFIG_PACKAGE_kmod-nft-core=y
           
-          # 空间/速度优化
           CONFIG_CLEAN_IPKG=y
           CONFIG_BUILDBOT=y
           
-          # 如果你用了 qmodem feed，可在这里启用
+          # 可选启用（如果 qmodem feed 已添加）
           # CONFIG_PACKAGE_luci-app-qmodem=y
           
-          # 其他可选包（根据需要打开）
-          # CONFIG_PACKAGE_luci-app-zerotier=y
+          # passwall 核心（推荐根据需要打开）
           # CONFIG_PACKAGE_xray-core=y
           # CONFIG_PACKAGE_v2fly-geoip=y
           # CONFIG_PACKAGE_v2fly-geosite=y
           EOF
           fi
           
-          # 无论哪种来源，都执行 defconfig
           make defconfig
           
-          # 打印关键配置供日志检查（方便调试）
-          echo "当前使用的 .config 关键部分如下："
-          grep -E "TARGET_x86|luci|passwall|mosdns|argon|firewall4|qmodem" .config || echo "(无匹配项)"
-          
-      # 下载依赖
+          echo "关键配置检查："
+          grep -E "TARGET_x86|luci|passwall|mosdns|argon|firewall4|qmodem" .config || echo "(无匹配)"
+
+      # 下载依赖包
       - name: Download dependencies
         working-directory: ./lede
         run: |
           make download -j$(nproc) || make download -j1 V=s
 
-      # 编译（4线程 + fallback）
+      # 编译固件
       - name: Build firmware
         working-directory: ./lede
         run: |
-          make -j$(nproc) V=s || make -j1 V=s
+          make -j$(nproc) V=s || make -j1 V=s  # fallback 单线程防 OOM
 
-      # 简单清理
+      # 清理临时文件
       - name: Clean temporary files
         run: |
           rm -rf lede/tmp/* || true
 
-      # 收集产物
-      - name: Organize artifacts
-        run: |
-          mkdir -p artifact
-          cp -r lede/bin/targets/*/*/* artifact/ 2>/dev/null || true
-          cp lede/bin/targets/*/*/*.img* artifact/ 2>/dev/null || true
-          cp lede/bin/targets/*/*/*.gz artifact/ 2>/dev/null || true
-          cp lede/bin/targets/*/*/*.tar.gz artifact/ 2>/dev/null || true
-          ls -lh artifact/
-
-      # 上传
-      - name: Upload firmware artifact
+      # 整理并上传产物
+      - name: Organize and upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: LEDE-firmware-x86_64-${{ github.run_number }}
-          path: artifact/
-
+          path: |
+            lede/bin/targets/**/*
           retention-days: 7
