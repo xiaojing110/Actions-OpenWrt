@@ -1,0 +1,192 @@
+name: Build LEDE Firmware
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'  # UTC 3:00 ≈ 北京 11:00
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 最大化磁盘空间（非常推荐，LEDE 编译吃空间）
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@v1
+        with:
+          root-reserve-mb: 512
+          swap-size-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      # 克隆 LEDE 源码
+      - name: Clone LEDE source
+        run: |
+          git clone https://github.com/coolsnowwolf/lede.git
+          cd lede
+
+      # 添加/修改 feeds（mosdns + passwall feed + luci 指定分支 + qmodem）
+      - name: Modify feeds.conf.default
+        working-directory: ./lede
+        run: |
+          # 指定 coolsnowwolf 的 luci 25.12 分支
+          sed -i '/^src-git luci/c\src-git luci https://github.com/coolsnowwolf/luci.git;openwrt-25.12' feeds.conf.default
+          
+          # 取消注释 qmodem（假设原文件中有 #src-git qmodem ...）
+          sed -i 's/^#src-git qmodem/src-git qmodem/' feeds.conf.default
+          
+          # 添加 mosdns feed（你原有的）
+          echo "src-git mosdns https://github.com/sbwml/luci-app-mosdns.git" >> feeds.conf.default
+          
+          # 如果你想加 passwall feed（但下面会用稀疏方式替换 app，所以可选注释）
+          # echo "src-git passwall https://github.com/Openwrt-Passwall/openwrt-passwall.git" >> feeds.conf.default
+          # echo "src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git" >> feeds.conf.default
+
+          cat feeds.conf.default  # 打印出来方便调试
+
+      # 更新并安装 feeds
+      - name: Update and install feeds
+        working-directory: ./lede
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # 替换 luci-app-passwall 为官方仓库版本（使用稀疏检出，节省空间）
+      - name: Replace luci-app-passwall with sparse checkout
+        working-directory: ./lede/feeds/luci/applications
+        run: |
+          echo "删除旧的 luci-app-passwall（如果存在）..."
+          rm -rf luci-app-passwall
+          
+          echo "克隆 openwrt-passwall 仓库（仅用于提取 app）..."
+          git clone --depth=1 https://github.com/Openwrt-Passwall/openwrt-passwall.git temp-passwall
+          
+          cd temp-passwall
+          git sparse-checkout init --cone
+          git sparse-checkout set luci-app-passwall
+          git checkout
+          
+          echo "移动 luci-app-passwall 到正确位置..."
+          mv luci-app-passwall ../../
+          
+          cd ..
+          rm -rf temp-passwall
+          
+          echo "luci-app-passwall 替换完成！"
+
+      # 自定义修改（IP、主题等）
+      - name: Apply custom patches
+        working-directory: ./lede
+        run: |
+          echo "修改默认 IP 地址为 10.0.0.1..."
+          sed -i 's/192.168.1.1/10.0.0.1/g' package/base-files/files/bin/config_generate
+          sed -i 's/192.168.1./10.0.0./g'   package/base-files/files/bin/config_generate
+          sed -i 's/192.168./10.0./g'        package/base-files/files/bin/config_generate
+          
+          echo "更新主题为 luci-theme-argon..."
+          # 替换默认主题（通常是 bootstrap 或 material）
+          find feeds/luci/collections/ -type f -name Makefile -exec \
+            sed -i -E 's/(luci-theme-)[a-zA-Z0-9_-]+/\1argon/g' {} \;
+          
+          # 如果 argon 没被包含，可额外在 .config 启用 CONFIG_PACKAGE_luci-theme-argon=y
+
+      # 缓存下载文件
+      - name: Cache downloads
+        uses: actions/cache@v4
+        with:
+          path: lede/dl
+          key: ${{ runner.os }}-lede-downloads-${{ hashFiles('lede/.config') }}
+          restore-keys: ${{ runner.os }}-lede-downloads-
+
+      # 缓存工具链（大幅提速）
+      - name: Cache toolchain
+        uses: actions/cache@v4
+        with:
+          path: lede/staging_dir
+          key: ${{ runner.os }}-lede-toolchain-${{ hashFiles('lede/.config') }}
+          restore-keys: ${{ runner.os }}-lede-toolchain-
+
+      # 准备 .config
+      - name: Prepare .config
+        working-directory: ./lede
+        run: |
+          # 优先使用仓库根目录的 .config（如果有）
+          if [ -f ../.config ]; then
+            cp ../.config ./
+          else
+            cat > .config << 'EOF'
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_x86_64_DEVICE_generic=y
+          
+          # 基础 LuCI
+          CONFIG_PACKAGE_luci=y
+          
+          # 常用组件
+          CONFIG_PACKAGE_luci-app-passwall=y
+          CONFIG_PACKAGE_luci-app-mosdns=y
+          
+          # 推荐：启用 argon 主题
+          CONFIG_PACKAGE_luci-theme-argon=y
+          
+          # firewall4 + nftables（推荐）
+          CONFIG_PACKAGE_firewall4=y
+          CONFIG_PACKAGE_nftables=y
+          CONFIG_PACKAGE_kmod-nft-core=y
+          
+          # 空间/速度优化
+          CONFIG_CLEAN_IPKG=y
+          CONFIG_BUILDBOT=y
+          
+          # 其他可选（按需打开）
+          # CONFIG_PACKAGE_luci-app-zerotier=y
+          # CONFIG_PACKAGE_luci-app-qmodem=y   # 如果你用了 qmodem feed
+          EOF
+          fi
+          
+          make defconfig
+          cat .config | grep -E "luci|passwall|mosdns|argon|firewall4"  # 打印关键配置供检查
+
+      # 下载依赖
+      - name: Download dependencies
+        working-directory: ./lede
+        run: |
+          make download -j$(nproc) || make download -j1 V=s
+
+      # 编译（4线程 + fallback）
+      - name: Build firmware
+        working-directory: ./lede
+        run: |
+          make -j$(nproc) V=s || make -j1 V=s
+
+      # 简单清理
+      - name: Clean temporary files
+        run: |
+          rm -rf lede/tmp/* || true
+
+      # 收集产物
+      - name: Organize artifacts
+        run: |
+          mkdir -p artifact
+          cp -r lede/bin/targets/*/*/* artifact/ 2>/dev/null || true
+          cp lede/bin/targets/*/*/*.img* artifact/ 2>/dev/null || true
+          cp lede/bin/targets/*/*/*.gz artifact/ 2>/dev/null || true
+          cp lede/bin/targets/*/*/*.tar.gz artifact/ 2>/dev/null || true
+          ls -lh artifact/
+
+      # 上传
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LEDE-firmware-x86_64-${{ github.run_number }}
+          path: artifact/
+          retention-days: 7
